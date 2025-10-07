@@ -13,6 +13,7 @@ Features
 Quick examples
 
 ```bash
+cd DQN
 python -m src.dqn_gridworld.cli --episodes 600 --render-every 1
 python -m src.dqn_gridworld.cli --episodes 800 --render-every 10 --sleep 0.01
 # Vary sizes 4..8 and resample layout every 20 episodes:
