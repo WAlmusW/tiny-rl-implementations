@@ -7,6 +7,7 @@ Relies on:
 - render.renderer.GridRenderer (optional)
 - config.CFG
 - utils.replay.ReplayBuffer
+- utils.metrics.MetricsLogger (for evaluation/plots)
 """
 from __future__ import annotations
 import random
@@ -21,6 +22,7 @@ from .env.gridworld import GridWorld
 from .env.layout import LayoutSampler, encode_obs_fixed
 from .render.renderer import GridRenderer  # may raise if tkinter unavailable
 from .utils.replay import ReplayBuffer
+from .utils.metrics import MetricsLogger
 
 
 def linear_decay(eps_start: float, eps_end: float, fraction: float) -> float:
@@ -89,6 +91,10 @@ def run(
         except Exception:
             renderer = None
 
+    # Metrics logger (CSV + PNG). Change output_dir as needed.
+    logger = MetricsLogger(output_dir="runs/dqn", auto_stamp=True)
+    losses_this_ep: list[float] = []
+
     global_step = 0
     try:
         for ep in range(1, episodes + 1):
@@ -111,6 +117,7 @@ def run(
             eps = linear_decay(eps_start, eps_end, frac)
 
             step = 0
+            res = None  # last step result placeholder
             while not done:
                 step += 1
                 a = agent.act(s, eps)
@@ -124,7 +131,9 @@ def run(
 
                 if len(replay) >= max(batch_size, warmup):
                     batch = replay.sample(batch_size)
-                    _ = agent.train_step(batch, clip_grad=CFG.agent.clip_grad)
+                    loss = agent.train_step(batch, clip_grad=CFG.agent.clip_grad)
+                    if loss is not None:
+                        losses_this_ep.append(float(loss))
 
                 if global_step % target_update == 0:
                     agent.target.copy_from(agent.q)
@@ -134,17 +143,40 @@ def run(
 
                 global_step += 1
 
+            # After episode ends: final render for quiet runs
             if renderer and (ep % render_every != 0):
                 renderer.draw(ep, step, total_reward, eps)
 
+            # compute average loss for the episode
+            avg_loss = float(np.mean(losses_this_ep)) if len(losses_this_ep) > 0 else 0.0
+
+            # derive terminal from last step result if available
+            terminal = None
+            if res is not None and hasattr(res, "info") and isinstance(res.info, dict):
+                terminal = res.info.get("terminal")
+
+            # record episode metrics
+            logger.log_episode(ep=ep, total_reward=total_reward, eps=eps, n_steps=step, avg_loss=avg_loss, terminal=terminal)
+
+            # console logging (existing)
             if ep % CFG.train.log_every == 0:
+                logger.flush()
                 print(
                     f"Episode {ep:4d}/{episodes} | eps={eps:.3f} | return={total_reward:+.2f} "
                     f"| size={env.size} pits={len(env.pits)} start={env.start} goal={env.goal}"
                 )
+
+            # reset per-episode loss buffer
+            losses_this_ep.clear()
 
     except KeyboardInterrupt:
         print("Training interrupted by user.")
     finally:
         if renderer:
             renderer.close()
+        # final flush of metrics (best-effort)
+        try:
+            final = logger.flush()
+            print(f"Final metrics saved to: {final['csv']}")
+        except Exception:
+            pass
