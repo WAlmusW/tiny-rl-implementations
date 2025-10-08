@@ -1,12 +1,24 @@
-"""Lightweight metrics logger + plotter for training runs.
+"""Lightweight metrics logger and plotter for training runs.
 
-Usage:
-    logger = MetricsLogger(output_dir="runs/exp1")
-    logger.log_step(...)  # optional per-step metrics
-    logger.log_episode(...)  # one call at episode end
-    logger.flush()  # write CSV and create plots
+This module provides a small, dependency-light utility to collect episode- and
+(optional) step-level metrics during training, persist them as CSV, and create
+diagnostic plots (PNG). It purposely keeps external dependencies minimal —
+only `numpy` and `matplotlib` are required for plotting.
 
-The module only depends on numpy + matplotlib (install via pip if needed).
+Usage
+-----
+logger = MetricsLogger(output_dir="runs/exp1")
+logger.log_episode(ep, total_reward, eps, n_steps, avg_loss, terminal)
+logger.log_step_time(duration)   # optional
+final = logger.flush()           # writes CSV + generates plots, returns file paths
+
+Design notes
+------------
+- The CSV contains one row per recorded episode; plots provide rolling statistics
+  and diagnostic visualizations commonly useful when developing RL agents.
+- Matplotlib is configured to use the "Agg" backend by default so the module
+  behaves on headless servers without an X display. If you need interactive plots,
+  change the backend before importing pyplot.
 """
 
 from __future__ import annotations
@@ -18,28 +30,41 @@ import numpy as np
 
 # matplotlib import only when plotting (so headless code can avoid import errors if not used)
 import matplotlib
-# prefer non-interactive backend for headless by default
+# Prefer non-interactive backend for headless environments by default.
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
 class MetricsLogger:
+    """Collect and persist training metrics for episodic RL.
+
+    The logger stores per-episode arrays for returns, epsilon values, steps,
+    average losses, and terminal outcomes. It can optionally store short
+    per-step timing measurements.
+
+    Args:
+        output_dir: base directory where CSV + PNGs will be written.
+        auto_stamp: if True append a unix timestamp suffix to output_dir to
+                    avoid overwriting previous runs.
+    """
+
     def __init__(self, output_dir: str = "runs/run", auto_stamp: bool = True):
         stamp = f"-{int(time.time())}" if auto_stamp else ""
         self.output_dir = f"{output_dir}{stamp}"
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # Per-episode lists
+        # Per-episode lists (parallel arrays)
         self.episodes: List[int] = []
         self.returns: List[float] = []
         self.epsilons: List[float] = []
         self.steps: List[int] = []
         self.avg_losses: List[float] = []
-        self.success: List[int] = []   # 1 if goal reached
-        self.pit: List[int] = []       # 1 if fell to pit
-        self.timeout: List[int] = []   # 1 if timed out
+        # Terminal outcomes tracked as binary indicators (1 if happened for that episode)
+        self.success: List[int] = []   # goal reached
+        self.pit: List[int] = []       # fell into pit
+        self.timeout: List[int] = []   # timed out
 
-        # optional per-step metrics (kept short)
+        # Optional per-step metrics (kept small)
         self.step_times: List[float] = []
 
     def log_episode(
@@ -51,22 +76,44 @@ class MetricsLogger:
         avg_loss: Optional[float] = None,
         terminal: Optional[str] = None,
     ):
-        """Record summary for one episode."""
+        """Record summary metrics for a single episode.
+
+        Args:
+            ep: episode index (int).
+            total_reward: cumulative reward obtained in the episode.
+            eps: epsilon value used during the episode (for tracking exploration).
+            n_steps: number of steps in the episode.
+            avg_loss: optional average loss recorded during the episode (float).
+            terminal: optional terminal reason string: "goal", "pit", "timeout", or None.
+        """
         self.episodes.append(ep)
         self.returns.append(float(total_reward))
         self.epsilons.append(float(eps))
         self.steps.append(int(n_steps))
         self.avg_losses.append(float(avg_loss) if avg_loss is not None else 0.0)
 
-        # terminal: one of "goal", "pit", "timeout", None
+        # Convert terminal string into one-hot binary tracking
         self.success.append(1 if terminal == "goal" else 0)
         self.pit.append(1 if terminal == "pit" else 0)
         self.timeout.append(1 if terminal == "timeout" else 0)
 
     def log_step_time(self, t: float):
+        """Append a per-step timing measurement (seconds).
+
+        This is optional and kept short to avoid excessive memory usage.
+        """
         self.step_times.append(float(t))
 
     def to_csv(self, filename: Optional[str] = None):
+        """Write the stored episode metrics to a CSV file.
+
+        Args:
+            filename: optional path to write to. If omitted, writes to
+                      `<output_dir>/metrics.csv`.
+
+        Returns:
+            str: path to the written CSV file.
+        """
         filename = filename or os.path.join(self.output_dir, "metrics.csv")
         headers = [
             "episode", "return", "eps", "steps", "avg_loss", "success", "pit", "timeout"
@@ -88,13 +135,17 @@ class MetricsLogger:
         return filename
 
     def plot(self, save_all: bool = True):
-        """Create and save diagnostic plots (PNG files) into output_dir."""
+        """Create and save diagnostic plots (PNG files) into output_dir.
+
+        Returns:
+            List[str]: paths to the created PNG files (empty list if no data).
+        """
         if len(self.episodes) == 0:
             return []
 
         out_files = []
 
-        # rolling helper
+        # rolling helper: simple moving average via convolution
         def rolling(x, window=20):
             if len(x) < window:
                 return np.array(x)
@@ -105,6 +156,7 @@ class MetricsLogger:
         plt.plot(self.episodes, self.returns, label="return")
         r = rolling(self.returns, window=20)
         if r.size > 0:
+            # align rolling curve with the rightmost episodes it covers
             plt.plot(self.episodes[len(self.episodes) - len(r):], r, label="rolling(20)")
         plt.xlabel("episode")
         plt.ylabel("return")
@@ -116,7 +168,7 @@ class MetricsLogger:
         plt.close()
         out_files.append(f1)
 
-        # 2) Epsilon
+        # 2) Epsilon schedule
         plt.figure(figsize=(6, 3))
         plt.plot(self.episodes, self.epsilons)
         plt.xlabel("episode")
@@ -128,7 +180,7 @@ class MetricsLogger:
         plt.close()
         out_files.append(f2)
 
-        # 3) Average loss
+        # 3) Average loss per episode (+ rolling)
         plt.figure(figsize=(8, 4))
         plt.plot(self.episodes, self.avg_losses, label="avg_loss")
         r2 = rolling(self.avg_losses, window=50)
@@ -144,7 +196,7 @@ class MetricsLogger:
         plt.close()
         out_files.append(f3)
 
-        # 4) Episode length
+        # 4) Episode length (# steps)
         plt.figure(figsize=(6, 3))
         plt.plot(self.episodes, self.steps)
         plt.xlabel("episode")
@@ -156,11 +208,9 @@ class MetricsLogger:
         plt.close()
         out_files.append(f4)
 
-        # 5) Terminal distribution (stacked)
+        # 5) Terminal distribution (cumulative rates for goal/pit/timeout)
         plt.figure(figsize=(6, 3))
-        arr = np.vstack([self.success, self.pit, self.timeout])
-        # cumulative / rolling fraction
-        cum = np.cumsum(arr, axis=1)
+        # cumulative fraction of episodes ending in each terminal type over time
         n = np.arange(1, len(self.episodes) + 1)
         plt.plot(self.episodes, np.cumsum(self.success) / n, label="goal rate (cum)")
         plt.plot(self.episodes, np.cumsum(self.pit) / n, label="pit rate (cum)")
@@ -178,6 +228,11 @@ class MetricsLogger:
         return out_files
 
     def flush(self):
+        """Write CSV and plot files, returning their paths.
+
+        Returns:
+            dict: {"csv": csv_path, "plots": [png_paths...]}
+        """
         csv_file = self.to_csv()
         pngs = self.plot()
         return {"csv": csv_file, "plots": pngs}
